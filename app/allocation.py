@@ -21,10 +21,18 @@
 
 * 沿固定顺序的 purge 之和超过 ``total_purge_capacity_mm3`` →
   ``PURGE_CAPACITY_EXCEEDED``，不产生任何分配；
-* purge 不超容但某材料全部料卷余量之和不足以覆盖该材料的累计需求
-  （purge + 打印体积）→ ``MATERIAL_SHORTAGE``，同样不产生任何分配；
-  总量足够但单卷容量碎片化导致无法完整分配时也按缺料处理并给出缺料明细；
-* 否则给出覆盖全部层段的完整分配（``ALLOCATED``）。
+* purge 不超容且已**证实**无法完整分配（库存总量不足，或 CP-SAT
+  对"存在完整分配"给出不可行证明）→ ``MATERIAL_SHORTAGE``，同样不产生
+  任何分配；
+* 已得到覆盖全部层段的完整分配 → ``ALLOCATED``。
+
+另有一种保守终态：CP-SAT 在限时内无法判定可行性（``UNKNOWN``）且免求解
+构造兜底也找不到完整分配时，既不能证明可行也不能证明无解，返回
+``UNKNOWN``——**不误报缺料**：``allocation`` 为空、各卷余量一律不扣减、
+``optimal=false``，``reason.undetermined_materials`` 列出未能判定的材料。
+多材料合并时，已证实缺料的材料优先于未判定材料（任一材料证实缺料即报
+``MATERIAL_SHORTAGE``）；只有"没有任何材料证实缺料、但存在未判定材料"
+时才整体返回 ``UNKNOWN``。
 
 优化目标（严格优先级）
 ----------------------
@@ -39,7 +47,9 @@
 
 特例（回归保证）：同材料连续两段分别需 4、6 时，余量恰为 4 与 6 的两卷
 必须能分配——第一段用余量 4 的卷（扣 4）、第二段用余量 6 的卷（扣 6），
-这是唯一可行分配，目标层面也不会被错误判成缺料。
+这是唯一可行分配，目标层面也不会被错误判成缺料。CP-SAT 限时未给出解时，
+多策略免求解兜底（按 ID 正 / 逆序的首选贴合与最宽松卷策略）同样必须覆盖
+该情形，不会因单一贪心失败而把可行请求报成缺料。
 """
 
 from __future__ import annotations
@@ -55,6 +65,15 @@ from .solver import build_instance
 ALLOCATED = "ALLOCATED"
 MATERIAL_SHORTAGE = "MATERIAL_SHORTAGE"
 PURGE_CAPACITY_EXCEEDED = "PURGE_CAPACITY_EXCEEDED"
+UNKNOWN = "UNKNOWN"
+
+# 单材料求解的三种终态（不得把后两者混为一谈）：
+# FEASIBLE   —— 已得到逐段选卷（是否已证最优由 proven 区分）；
+# INFEASIBLE —— CP-SAT 已证明不存在完整分配（碎片化）；
+# UNDECIDED  —— 限时内无法判定可行性，构造兜底也未找到完整分配。
+FEASIBLE = "FEASIBLE"
+INFEASIBLE = "INFEASIBLE"
+UNDECIDED = "UNDECIDED"
 
 
 @dataclass
@@ -224,25 +243,25 @@ def _assignment_of(
     return result
 
 
-def _greedy_assignment(
+def _first_fit(
     items: List[FixedSegment],
-    spool_ids: List[str],
+    ordered_spools: List[str],
     capacities: Dict[str, int],
     adjacent: List[bool],
 ) -> Optional[List[str]]:
-    """免求解构造兜底：按 spool_id 升序，优先沿用同材料相邻的当前卷，
-    否则取第一卷够量者；跨材料边界后没有可沿用的卷。
+    """免求解单遍构造：给定料卷尝试顺序，逐段选第一卷够量者。
 
-    卸下料卷即回到库存池：后续不相邻段仍可复用任意一卷，余量按累计扣减。
-    找不到完整分配时返回 ``None``（总量不足或碎片化导致）。
+    同材料相邻段（``adjacent[t]`` 为真）优先沿用紧邻上一段的卷；其余按
+    ``ordered_spools`` 的顺序取第一卷够量者。找不到完整分配时返回
+    ``None``——**不代表无解**，只代表本策略失败。
     """
-    used: Dict[str, int] = {s: 0 for s in spool_ids}
+    used: Dict[str, int] = {s: 0 for s in ordered_spools}
     result: List[str] = []
     for t, it in enumerate(items):
-        candidates = list(spool_ids)
+        candidates = ordered_spools
         if adjacent[t] and result:
             current = result[-1]
-            candidates = [current] + [s for s in spool_ids if s != current]
+            candidates = [current] + [s for s in ordered_spools if s != current]
         for s in candidates:
             if used[s] + it.demand <= capacities[s]:
                 used[s] += it.demand
@@ -253,6 +272,77 @@ def _greedy_assignment(
     return result
 
 
+def _constructive_assignment(
+    items: List[FixedSegment],
+    spool_ids: List[str],
+    capacities: Dict[str, int],
+    adjacent: List[bool],
+) -> Optional[List[str]]:
+    """多策略免求解兜底：任一策略找到完整分配即可，按目标择优返回。
+
+    单一首卷贪心会误杀可行情形（典型回归：两段需 4、6，A 卷余量 6、B 卷
+    余量 4，按 ID 升序首卷贪心首段选 A=6、次段两卷均不够而失败，而
+    B→A 才是唯一可行分配）。这里同时尝试：
+
+    * 料卷 ID 升序 / 降序的首卷够量（优先沿用相邻同卷）；
+    * 以"扣后余量最小的够量卷"（best-fit，最贴合）与"余量最大的够量卷"
+      （worst-fit，最宽松）逐段选择。
+
+    多个策略都成功时，与主目标一致地按 (变化次数, 逐段 ID 字典序) 取最优，
+    但兜底解一律不声称最优。
+    """
+    if not items:
+        return []
+
+    candidates: List[List[str]] = []
+
+    def offer(assignment: Optional[List[str]]) -> None:
+        if assignment is not None and assignment not in candidates:
+            candidates.append(assignment)
+
+    offer(_first_fit(items, list(spool_ids), capacities, adjacent))
+    offer(_first_fit(items, list(reversed(spool_ids)), capacities, adjacent))
+
+    def fit(prefer_tight: bool) -> Optional[List[str]]:
+        used: Dict[str, int] = {s: 0 for s in spool_ids}
+        result: List[str] = []
+        for t, it in enumerate(items):
+            options = [
+                s for s in spool_ids
+                if used[s] + it.demand <= capacities[s]
+            ]
+            if adjacent[t] and result and result[-1] in options:
+                # 同材料相邻：沿用上一卷天然不增加变化次数，优先
+                chosen = result[-1]
+            elif not options:
+                return None
+            else:
+                # best-fit：选扣后余量最小（最贴合）的够量卷；
+                # worst-fit：选余量最大（最宽松）的够量卷，为后续留余地。
+                # 余量相同按料卷 ID 升序，保证结果确定。
+                chosen = sorted(
+                    options,
+                    key=lambda s: (
+                        capacities[s] - used[s] - it.demand
+                        if prefer_tight else -(capacities[s] - used[s]),
+                        s,
+                    ),
+                )[0]
+            used[chosen] += it.demand
+            result.append(chosen)
+        return result
+
+    offer(fit(True))
+    offer(fit(False))
+
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda a: (_changes_of(a, adjacent), tuple(a)),
+    )
+
+
 def _changes_of(assignment: List[str], adjacent: List[bool]) -> int:
     return sum(
         1
@@ -261,16 +351,38 @@ def _changes_of(assignment: List[str], adjacent: List[bool]) -> int:
     )
 
 
+@dataclass
+class MaterialResult:
+    """单材料求解终态。
+
+    ``state`` 取值：``FEASIBLE`` / ``INFEASIBLE`` / ``UNDECIDED``。
+    FEASIBLE 时 ``assignment`` 给出逐段选卷、``proven`` 表示两级目标是否
+    均已证明；INFEASIBLE / UNDECIDED 时 ``assignment`` 为 ``None``，
+    调用方不得把 UNDECIDED 当作缺料。
+    """
+
+    state: str
+    assignment: Optional[List[str]]
+    proven: bool
+    changes: int
+    message: str
+
+
 def _solve_material(
     items: List[FixedSegment],
     spool_ids: List[str],
     capacities: Dict[str, int],
     adjacent: List[bool],
     time_limit: float,
-) -> Tuple[Optional[List[str]], bool, int, str]:
-    """单材料两阶段求解，返回 (逐段选卷, 是否全程证明最优, 变化次数, 消息)。
+) -> MaterialResult:
+    """单材料两阶段求解，严格区分三种终态。
 
-    无可行解时选卷为 ``None``（调用方据此报缺料）。
+    * CP-SAT 证明不可行（``INFEASIBLE``）→ 已证无解，调用方据此报缺料；
+    * CP-SAT 限时内 ``UNKNOWN``：先用多策略免求解构造兜底——兜底成功按
+      可行解返回（未证最优），兜底仍失败返回 ``UNDECIDED``（**不是**缺料，
+      可能可行也可能无解）；
+    * 得到可行解（``OPTIMAL`` / ``FEASIBLE``）：再做变化次数锁定下的
+      逐段料卷 ID 字典序决胜，未在限时内完成证明则 ``proven=False``。
     """
     total_demand = sum(it.demand for it in items)
     art = _build_material_model(items, spool_ids, capacities, adjacent)
@@ -282,17 +394,37 @@ def _solve_material(
     code = solver.Solve(art.model)
 
     if code == cp_model.INFEASIBLE:
-        return None, False, 0, "料卷余量无法完整分配该材料的层段需求"
+        return MaterialResult(
+            state=INFEASIBLE,
+            assignment=None,
+            proven=False,
+            changes=0,
+            message="料卷余量无法完整分配该材料的层段需求",
+        )
     if code not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        greedy = _greedy_assignment(items, spool_ids, capacities, adjacent)
-        if greedy is None:
-            return None, False, 0, f"限时内无法判定可行性（{solver.StatusName(code)}）"
-        return (
-            greedy,
-            False,
-            _changes_of(greedy, adjacent),
-            f"限时内 CP-SAT 未给出可行解（{solver.StatusName(code)}）；"
-            "返回构造性选卷，未证明变化次数与字典序最优",
+        status_name = solver.StatusName(code)
+        constructed = _constructive_assignment(
+            items, spool_ids, capacities, adjacent
+        )
+        if constructed is None:
+            # 未判定：CP-SAT 没给结论，构造兜底也失败——既不能报缺料，
+            # 也给不出可行分配，交由调用方合并为整体 UNKNOWN。
+            return MaterialResult(
+                state=UNDECIDED,
+                assignment=None,
+                proven=False,
+                changes=0,
+                message=f"限时内无法判定可行性（{status_name}），构造性兜底未找到完整分配",
+            )
+        return MaterialResult(
+            state=FEASIBLE,
+            assignment=constructed,
+            proven=False,
+            changes=_changes_of(constructed, adjacent),
+            message=(
+                f"限时内 CP-SAT 未给出可行解（{status_name}）；"
+                "返回构造性选卷，未证明变化次数与字典序最优"
+            ),
         )
 
     assignment = _assignment_of(solver, art)
@@ -320,11 +452,12 @@ def _solve_material(
         message = "料卷变化次数已证最小；字典序决胜在限时内未完全证明"
     else:
         message = "限时内得到可行选卷，未证明变化次数与字典序最优"
-    return (
-        lex_assignment,
-        proven,
-        _changes_of(lex_assignment, adjacent),
-        message,
+    return MaterialResult(
+        state=FEASIBLE,
+        assignment=lex_assignment,
+        proven=proven,
+        changes=_changes_of(lex_assignment, adjacent),
+        message=message,
     )
 
 
@@ -464,14 +597,15 @@ def allocate(req: AllocateRequest) -> dict:
         }
 
     # ---- 逐材料独立求解（目标也只在同材料相邻段之间产生）----
-    # 各材料共享一个总时限（默认取 time_limit_seconds），避免材料数 × 单材料时限
+    # 各材料共享一个总时限（默认取 time_limit_seconds），避免材料数 × 单材料时限。
+    # 先收集全部材料的终态再合并：已证缺料优先于未判定，未判定优先于可行，
+    # 绝不能把"限时内无法判定"与"已证无解"混为一谈。
     import time
 
     time_limit = float(req.time_limit_seconds or 15.0)
     wall_deadline = time.monotonic() + time_limit
-    assignment_by_order: Dict[int, str] = {}
-    all_proven = True
-    messages: List[str] = []
+    results: Dict[str, MaterialResult] = {}
+    material_items: Dict[str, List[FixedSegment]] = {}
     for mat, items in sorted(items_by_material.items()):
         spool_ids = spools_by_material.get(mat, [])
         caps = {s: capacity_of[s] for s in spool_ids}
@@ -481,42 +615,104 @@ def allocate(req: AllocateRequest) -> dict:
             items[t].order == items[t - 1].order + 1 for t in range(1, len(items))
         ]
         remaining = max(wall_deadline - time.monotonic(), 0.05)
-        chosen, proven, _changes, message = _solve_material(
+        results[mat] = _solve_material(
             items, spool_ids, caps, adjacent, min(time_limit, remaining)
         )
-        if chosen is None:
-            # 总量够但碎片化（无单卷组合可装下）：如实报缺料，不给部分分配
+        material_items[mat] = items
+
+    infeasible_mats = [m for m, r in results.items() if r.state == INFEASIBLE]
+    undecided_mats = [m for m, r in results.items() if r.state == UNDECIDED]
+
+    # ---- 终态 2：存在"已证明无法完整分配"的材料 → 缺料（优先于未判定）----
+    if infeasible_mats:
+        deficits = []
+        messages = []
+        for mat in infeasible_mats:
+            items = material_items[mat]
             need = sum(it.demand for it in items)
-            return {
-                "status": MATERIAL_SHORTAGE,
-                "optimal": False,
-                "allocation": [],
-                "spools": _idle_spools(req),
-                "spool_changes": 0,
-                "purge_used_mm3": purge_used,
-                "purge_remaining_mm3": capacity - purge_used,
-                "reason": {
-                    "code": MATERIAL_SHORTAGE,
-                    "message": (
-                        f"材料 {mat} 余量总量 {need} mm^3 虽够，但单卷容量碎片化，"
-                        "没有任何料卷组合能在逐段整卷扣减下完整分配；"
-                        "未产生任何分配"
-                    ),
-                    "deficits": [
-                        {
-                            "material_id": mat,
-                            "required_mm3": need,
-                            "available_mm3": need,
-                            "shortage_mm3": 0,
-                        }
-                    ],
-                },
-                "solver_message": message,
-            }
-        all_proven = all_proven and proven
-        if message:
-            messages.append(f"{mat}: {message}")
-        for it, s in zip(items, chosen):
+            avail = sum(
+                capacity_of[s] for s in spools_by_material.get(mat, [])
+            )
+            deficits.append(
+                {
+                    "material_id": mat,
+                    "required_mm3": need,
+                    "available_mm3": avail,
+                    "shortage_mm3": max(need - avail, 0),
+                }
+            )
+            messages.append(f"{mat}: {results[mat].message}")
+        deficits.sort(key=lambda d: d["material_id"])
+        names = "、".join(d["material_id"] for d in deficits)
+        return {
+            "status": MATERIAL_SHORTAGE,
+            "optimal": False,
+            "allocation": [],
+            "spools": _idle_spools(req),
+            "spool_changes": 0,
+            "purge_used_mm3": purge_used,
+            "purge_remaining_mm3": capacity - purge_used,
+            "reason": {
+                "code": MATERIAL_SHORTAGE,
+                "message": (
+                    f"材料 {names} 的库存余量虽在，但单卷容量碎片化，"
+                    "没有任何料卷组合能在逐段整卷扣减下完整分配"
+                    "（CP-SAT 已证无解）；未产生任何分配"
+                ),
+                "deficits": deficits,
+            },
+            "solver_message": "；".join(messages),
+        }
+
+    # ---- 保守终态：无已证缺料，但有材料限时内未判定 → UNKNOWN ----
+    # 既不能报缺料（可能可行），也给不出已验证的完整分配（不给部分分配）：
+    # 空 allocation、各卷一律不扣减、optimal=false。
+    if undecided_mats:
+        undecided_mats.sort()
+        messages = [
+            f"{m}: {results[m].message}" for m in undecided_mats
+        ]
+        # 已得到可行解的材料其结论同样不完整输出（整体未判定），但保留说明
+        feasible_notes = [
+            f"{m}: {results[m].message}"
+            for m in sorted(results)
+            if results[m].state == FEASIBLE
+        ]
+        detail = "；".join(messages + feasible_notes)
+        return {
+            "status": UNKNOWN,
+            "optimal": False,
+            "allocation": [],
+            "spools": _idle_spools(req),
+            "spool_changes": 0,
+            "purge_used_mm3": purge_used,
+            "purge_remaining_mm3": capacity - purge_used,
+            "reason": {
+                "code": UNKNOWN,
+                "message": (
+                    "材料 "
+                    + "、".join(undecided_mats)
+                    + " 在限时内既未找到完整分配，也未能证明无解；"
+                    "未产生任何分配、库存未扣减（不按缺料处理，"
+                    "可放宽 time_limit_seconds 后重试）"
+                ),
+                "undetermined_materials": undecided_mats,
+            },
+            "solver_message": detail,
+        }
+
+    # ---- 终态 3：全部材料均有可行分配，组装扣减 ----
+    assignment_by_order: Dict[int, str] = {}
+    all_proven = True
+    messages: List[str] = []
+    for mat in sorted(results):
+        result = results[mat]
+        chosen = result.assignment
+        assert chosen is not None  # FEASIBLE 必有选卷
+        all_proven = all_proven and result.proven
+        if result.message:
+            messages.append(f"{mat}: {result.message}")
+        for it, s in zip(material_items[mat], chosen):
             assignment_by_order[it.order] = s
 
     return _build_allocation(
@@ -526,7 +722,7 @@ def allocate(req: AllocateRequest) -> dict:
 
 
 def _idle_spools(req: AllocateRequest) -> List[dict]:
-    """缺料 / 超容时各卷原样列出：累计扣减为 0、无逐段明细。"""
+    """缺料 / 超容 / 未判定时各卷原样列出：累计扣减为 0、无逐段明细。"""
     return [
         {
             "spool_id": sp.spool_id,

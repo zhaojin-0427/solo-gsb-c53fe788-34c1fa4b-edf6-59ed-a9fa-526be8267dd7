@@ -428,6 +428,152 @@ def test_fragmentation_reported_as_shortage():
     assert all(sp["deducted_mm3"] == 0 for sp in d["spools"])
 
 
+# ------------------- 未判定（UNKNOWN）与缺料的区分 -------------------
+
+
+def _force_cpsat_status(monkeypatch, status_of):
+    """让 CpSolver.solve 跑真实求解后按 status_of(model, code) 覆写终态。
+
+    覆写响应里的 status 字段（而非直接替换 solve），保证求解器已解析响应、
+    Value() 仍可用（FEASIBLE 路径需要读变量取值）。
+    """
+    from app import allocation
+
+    real_solve = allocation.cp_model.CpSolver.solve
+
+    def fake_solve(self, model, solution_callback=None):
+        code = real_solve(self, model, solution_callback)
+        forced = status_of(model, code)
+        if forced is not None:
+            self._CpSolver__response.status = forced
+            return forced
+        return code
+
+    monkeypatch.setattr(allocation.cp_model.CpSolver, "solve", fake_solve)
+
+
+def test_unknown_when_cpsat_undecided_and_fallback_fails(monkeypatch):
+    """CP-SAT 限时 UNKNOWN 且构造兜底也失败：返回 UNKNOWN，不得误报缺料。
+
+    库存总量充足（A 卷余量合计 20 ≥ 需求 10），用 monkeypatch 令 CP-SAT
+    对该材料始终返回 UNKNOWN，并把构造兜底置为失败——这正是旧实现把
+    "未判定"当成"已证无解"而误报 MATERIAL_SHORTAGE 的路径。
+    """
+    from app import allocation
+
+    _force_cpsat_status(monkeypatch, lambda model, code: allocation.cp_model.UNKNOWN)
+    monkeypatch.setattr(
+        allocation, "_constructive_assignment", lambda *a, **k: None
+    )
+
+    payload = _base(
+        [_job("J1", _seg("A", 5), _seg("A", 5)), _job("J2", _seg("B", 1))],
+        [_spool("A1", "A", 10), _spool("B1", "B", 10)],
+        [_ref("J1", 1), _ref("J1", 2), _ref("J2", 1)],
+        time_limit=0.1,
+    )
+    d = post(payload).json()
+    assert d["status"] == "UNKNOWN"
+    assert d["optimal"] is False
+    assert d["allocation"] == []
+    assert d["spool_changes"] == 0
+    # 未判定不扣减任何余量：各卷原样列出
+    assert all(sp["deducted_mm3"] == 0 for sp in d["spools"])
+    assert {sp["spool_id"]: sp["remaining_mm3"] for sp in d["spools"]} == {
+        "A1": 10, "B1": 10,
+    }
+    assert d["reason"]["code"] == "UNKNOWN"
+    # 两种材料都被强制 UNKNOWN 且兜底失败：均列为未判定（关键是 A 未被
+    # 误判成缺料）
+    assert d["reason"]["undetermined_materials"] == ["A", "B"]
+    assert "UNKNOWN" in d["solver_message"]
+
+
+def test_constructive_fallback_returns_allocated_when_cpsat_times_out(monkeypatch):
+    """CP-SAT 限时 UNKNOWN 但多策略兜底能构造完整分配：ALLOCATED + 实际扣减。
+
+    同材料连续两段需 4、6，按 ID 排序的卷余量为 6、4（题述 A 卷 6、B 卷 4）：
+    旧的单一按 ID 首卷贪心会失败，新多策略兜底必须找到 B→A 的唯一分配。
+    """
+    from app import allocation
+
+    _force_cpsat_status(monkeypatch, lambda model, code: allocation.cp_model.UNKNOWN)
+
+    payload = _base(
+        [_job("J1", _seg("A", 4), _seg("A", 6)), _job("J2", _seg("B", 1))],
+        [_spool("SA", "A", 6), _spool("SB", "A", 4), _spool("SBX", "B", 10)],
+        [_ref("J1", 1), _ref("J1", 2), _ref("J2", 1)],
+        purge={"A": {"A": 0, "B": 0}, "B": {"A": 0, "B": 0}},
+        capacity=0,
+        time_limit=0.1,
+    )
+    d = post(payload).json()
+    assert d["status"] == "ALLOCATED"
+    picks = [(a["order"], a["spool_id"], a["deducted_mm3"]) for a in d["allocation"]]
+    assert picks == [(1, "SB", 4), (2, "SA", 6), (3, "SBX", 1)]
+    # 兜底解未证最优
+    assert d["optimal"] is False
+    assert {sp["spool_id"]: sp["remaining_mm3"] for sp in d["spools"]} == {
+        "SA": 0, "SB": 0, "SBX": 9,
+    }
+
+
+def test_proven_shortage_takes_precedence_over_unknown(monkeypatch):
+    """多材料合并：一个材料已证无解、另一个未判定 → 仍报 MATERIAL_SHORTAGE。
+
+    A 材料总量充足但碎片化（卷 5+5 装不下需求 10 的单段？否——单段需求 10、
+    两卷各 5 才是真碎片化无解）；B 材料足量但令 CP-SAT 返回 UNKNOWN 且
+    兜底失败。已证缺料的 A 必须优先于未判定的 B。
+    """
+    from app import allocation
+
+    def status_of(model, code):
+        names = " ".join(v.name for v in model.proto.variables)
+        if "SB1" in names:
+            return allocation.cp_model.UNKNOWN
+        return allocation.cp_model.INFEASIBLE
+
+    _force_cpsat_status(monkeypatch, status_of)
+    monkeypatch.setattr(
+        allocation, "_constructive_assignment", lambda *a, **k: None
+    )
+
+    payload = _base(
+        [_job("J1", _seg("A", 10)), _job("J2", _seg("B", 10))],
+        [_spool("SA1", "A", 5), _spool("SA2", "A", 5), _spool("SB1", "B", 100)],
+        [_ref("J1", 1), _ref("J2", 1)],
+        time_limit=0.1,
+    )
+    d = post(payload).json()
+    assert d["status"] == "MATERIAL_SHORTAGE"
+    assert d["allocation"] == []
+    assert d["reason"]["deficits"][0]["material_id"] == "A"
+    assert d["reason"]["deficits"][0]["available_mm3"] == 10
+    assert all(sp["deducted_mm3"] == 0 for sp in d["spools"])
+
+
+def test_feasible_but_unproven_solution_is_allocated_not_optimal(monkeypatch):
+    """CP-SAT 只给 FEASIBLE（未证最优）：ALLOCATED 且扣减，但 optimal=false。"""
+    from app import allocation
+
+    _force_cpsat_status(monkeypatch, lambda model, code: allocation.cp_model.FEASIBLE)
+
+    payload = _base(
+        [_job("J1", _seg("A", 5), _seg("A", 5), _seg("A", 5)),
+         _job("J2", _seg("B", 1))],
+        [_spool("A1", "A", 100), _spool("A2", "A", 100), _spool("B1", "B", 10)],
+        [_ref("J1", 1), _ref("J1", 2), _ref("J1", 3), _ref("J2", 1)],
+        time_limit=0.1,
+    )
+    d = post(payload).json()
+    assert d["status"] == "ALLOCATED"
+    assert d["optimal"] is False
+    assert len(d["allocation"]) == 4
+    # 已有可行解即完成扣减，不自洽为 0
+    assert sum(sp["deducted_mm3"] for sp in d["spools"]) == 16
+    assert "未证明" in d["solver_message"]
+
+
 # --------------------------------- 422 ---------------------------------
 
 

@@ -32,7 +32,10 @@
 服务经现有校验与 `build_instance` 取每段材料与名义体积，沿顺序从初始材料计算
 换料 purge；每段的**换料 purge 与打印体积都从该段目标材料所选料卷扣除**
 （每段恰选一卷），卸下的料卷重新进入库存池、可被后续层段复用。分配先最小化
-**相邻层段料卷 ID 变化次数**，再按逐段料卷 ID 的字典序决胜。
+**相邻层段料卷 ID 变化次数**，再按逐段料卷 ID 的字典序决胜。服务严格区分
+**已证实无解（缺料）、限时内未判定（UNKNOWN）与可行解**：未判定时返回空
+分配且不扣减余量，绝不误报缺料；可行解按实际选卷扣减，未证明最优不标
+`optimal=true`。
 
 ---
 
@@ -648,15 +651,20 @@ curl -i -X POST http://localhost:8000/executions/audit \
 2. 变化次数相同时，逐段所选料卷 ID 元组的**字典序最小**（按顺序位置逐位
    比较，料卷 ID 字符串升序）。
 
-三种 200 状态：
+四种 200 状态：
 
 | `status` | 含义 |
 | --- | --- |
-| `ALLOCATED` | 找到覆盖全部层段的完整分配；`optimal` 表示两级目标是否均已证明最优 |
-| `MATERIAL_SHORTAGE` | 某材料全部料卷余量之和不足以覆盖该材料的累计需求（含换料 purge 与打印体积），或单卷容量碎片化导致逐段整卷扣减无法装下；**不产生任何分配**，`reason.deficits` 给出各材料缺料量 |
+| `ALLOCATED` | 找到覆盖全部层段的完整分配；`optimal` 表示两级目标是否均已证明最优；得到可行解但未证最优时同样为 `false`，分配与扣减照常给出 |
+| `MATERIAL_SHORTAGE` | **已证实**无法完整分配：某材料全部料卷余量之和不足以覆盖累计需求（含换料 purge 与打印体积），或单卷容量碎片化导致逐段整卷扣减确无任何可行组合（CP-SAT 已证不可行）；**不产生任何分配**，`reason.deficits` 给出各材料缺料量 |
 | `PURGE_CAPACITY_EXCEEDED` | 沿固定顺序的 purge 之和已超过 `total_purge_capacity_mm3`（顺序固定无法重排）；**不产生任何分配**，`reason` 给出所需 purge 与容量 |
+| `UNKNOWN` | CP-SAT 在限时内无法判定可行性（返回 UNKNOWN）且免求解构造兜底也未找到完整分配；**不等于缺料**——`allocation` 为空、各卷余量一律**不扣减**、`optimal=false`，`reason.undetermined_materials` 列出未能判定的材料，可放宽 `time_limit_seconds` 后重试 |
 
-缺料 / 超容时 `allocation` 为空、各卷累计扣减为 0（库存原样列出）。
+多材料合并时**已证实缺料优先于未判定**：即使另一材料处于未判定状态，
+只要有材料被证实缺料就返回 `MATERIAL_SHORTAGE`；只有"无任何材料证实
+缺料、但存在未判定材料"时才返回 `UNKNOWN`。
+
+缺料 / 超容 / 未判定时 `allocation` 为空、各卷累计扣减为 0（库存原样列出）。
 
 请求字段（仅列新增部分，其余字段与 `/plans` 完全一致）：
 
@@ -838,6 +846,46 @@ curl -X POST http://localhost:8000/spools/allocate \
 不重排），`reason.purge_required_mm3` / `reason.capacity_mm3` 给出所需 purge
 与容量，`purge_remaining_mm3` 为负值；该状态优先于缺料判定。
 
+#### 未判定响应（UNKNOWN，不误报缺料）
+
+当 CP-SAT 在 `time_limit_seconds` 内既找不到完整分配、也给不出不可行证明
+（返回 `UNKNOWN`），且多策略免求解构造兜底也未找到完整分配时，服务返回
+`UNKNOWN` 而非 `MATERIAL_SHORTAGE`——此时可能可行也可能无解，**按缺料
+处理会误停线**。响应中 `allocation` 为空、各卷累计扣减为 0（余量原样
+保留）、`optimal=false`，`reason.undetermined_materials` 给出未能判定的
+材料（下例中 A、B 两种材料均未判定；`solver_message` 逐材料说明）：
+
+```json
+{
+  "status": "UNKNOWN",
+  "optimal": false,
+  "allocation": [],
+  "spools": [
+    {"spool_id": "A1", "material_id": "A",
+     "initial_remaining_mm3": 10, "deducted_mm3": 0, "remaining_mm3": 10,
+     "deductions": []},
+    {"spool_id": "B1", "material_id": "B",
+     "initial_remaining_mm3": 10, "deducted_mm3": 0, "remaining_mm3": 10,
+     "deductions": []}
+  ],
+  "spool_changes": 0,
+  "purge_used_mm3": 0,
+  "purge_remaining_mm3": 1000000,
+  "reason": {
+    "code": "UNKNOWN",
+    "message": "材料 A、B 在限时内既未找到完整分配，也未能证明无解；未产生任何分配、库存未扣减（不按缺料处理，可放宽 time_limit_seconds 后重试）",
+    "undetermined_materials": ["A", "B"]
+  },
+  "solver_message": "A: 限时内无法判定可行性（UNKNOWN），构造性兜底未找到完整分配；B: 限时内无法判定可行性（UNKNOWN），构造性兜底未找到完整分配"
+}
+```
+
+合并规则：多个材料中只要有一个被**证实**缺料（库存总量不足或 CP-SAT
+证明碎片化无解），即使其他材料未判定，也返回 `MATERIAL_SHORTAGE`；
+只有"没有任何材料证实缺料、但至少一个材料未判定"时才返回 `UNKNOWN`。
+反之，若 CP-SAT 超时但构造兜底（或求解器本身）已给出可行分配，则正常
+返回 `ALLOCATED`、按解扣减余量，仅 `optimal` 如实置为 `false`。
+
 #### 料卷分配请求的 422
 
 除继承 `/plans` 的全部 422 规则外，以下情况在进入分配前即返回 **422**：
@@ -902,7 +950,7 @@ curl -i -X POST http://localhost:8000/plans \
 ├── tests/
 │   ├── test_plans.py            # 16 个端到端测试（最优性、无解、交错、优先级、长作业、超时兜底、422 等）
 │   ├── test_executions_audit.py # 19 个端到端测试（完成/进行中、保留空闲、重叠、层序、换料留时、purge 与超容、422 等）
-│   └── test_spools_allocate.py  # 16 个端到端测试（选卷扣减、复用、变化次数优先、字典序决胜、4/6 边界、缺料/超容、422 等）
+│   └── test_spools_allocate.py  # 20 个端到端测试（选卷扣减、复用、变化次数优先、字典序决胜、4/6 边界、缺料/超容、未判定 UNKNOWN 与缺料区分、422 等）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -977,6 +1025,24 @@ curl -i -X POST http://localhost:8000/plans \
 卸下即复用，跨 run 使用同一卷只增加累计负载、不产生额外约束。目标为
 同材料相邻段选卷不同的次数（布尔蕴含刻画"两段同选一卷"），先最小化该
 次数；再逐位贪心固定料卷 ID（每步一次锁定最优次数的 CP-SAT 可行性
-证明）得到逐段料卷 ID 字典序最小解。任一步限时内无法判定，则返回当前
-可行选卷并把 `optimal` 置为 `false`；总量充足但单卷碎片化导致 CP 不可行
-时如实报 `MATERIAL_SHORTAGE`，缺料 / 超容均不产生任何部分分配。
+证明）得到逐段料卷 ID 字典序最小解。
+
+单材料求解严格区分三种终态，不把"未判定"与"已证无解"混为一谈：
+
+1. CP-SAT 证明不可行（`INFEASIBLE`）——总量充足但单卷碎片化、确无任何
+   完整分配，该材料为**已证缺料**；
+2. CP-SAT 限时内返回 `UNKNOWN`——先交多策略免求解构造兜底（料卷 ID
+   正/逆序首卷够量、逐段最贴合卷 best-fit、最宽松卷 worst-fit，同材料相邻
+   优先沿用同卷；任一策略成功即按 (变化次数, 逐段 ID 字典序) 择优），
+   兜底成功按可行解返回但 `optimal=false`；兜底也失败则该材料**未判定**，
+   不是缺料；
+3. CP-SAT 给出可行解（`OPTIMAL`/`FEASIBLE`）——再做字典序决胜，任一步
+   限时内无法证明则返回当前可行选卷并把 `optimal` 置为 `false`。
+
+多材料合并规则：**已证缺料优先于未判定，未判定优先于可行**。任一材料
+已证缺料即整体报 `MATERIAL_SHORTAGE`（不给部分分配）；没有已证缺料、
+但存在未判定材料时整体返回 `UNKNOWN`：`allocation` 为空、各卷余量一律
+不扣减、`optimal=false`，`reason.undetermined_materials` 列出未判定材料，
+可放宽 `time_limit_seconds` 后重试；只有全部材料都得到可行解时才
+`ALLOCATED` 并按解实际扣减，未证最优绝不标 `optimal=true`。缺料 / 超容 /
+未判定均不产生任何部分分配。
