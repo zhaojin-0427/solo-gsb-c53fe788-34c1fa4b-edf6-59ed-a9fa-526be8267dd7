@@ -32,7 +32,10 @@
 服务经现有校验与 `build_instance` 取每段材料与名义体积，沿顺序从初始材料计算
 换料 purge；每段的**换料 purge 与打印体积都从该段目标材料所选料卷扣除**
 （每段恰选一卷），卸下的料卷重新进入库存池、可被后续层段复用。分配先最小化
-**相邻层段料卷 ID 变化次数**，再按逐段料卷 ID 的字典序决胜。
+**相邻层段料卷 ID 变化次数**，再按逐段料卷 ID 的字典序决胜。求解按材料拆分
+独立进行，结论严格区分三态：**已证无解**才报缺料；限时内**未判定**
+（CP-SAT 超时且构造兜底失败）返回 `UNKNOWN`、不产生任何分配；找到可行解
+则给出完整扣减，未证明最优时不标记 `optimal`。
 
 ---
 
@@ -628,6 +631,11 @@ curl -i -X POST http://localhost:8000/executions/audit \
 
 ### `POST /spools/allocate` 固定顺序料卷分配
 
+服务经 `docker compose up --build -d` 一键启动后（见
+[一、Docker Compose 一键启动](#一docker-compose-一键启动)），即可通过
+`POST http://localhost:8000/spools/allocate` 访问该接口；交互式文档见
+http://localhost:8000/docs 。
+
 提交 `/plans` 的全部请求参数，外加 **`spools`（料卷库存）** 与 **`order`
 （固定层段顺序）**。与 `/plans` 不同，层段顺序**不由求解器重排**：`order`
 是调用方给定的 `(作业 ID, 层序)` 序列，跨作业可以交错，但必须**覆盖全部
@@ -648,15 +656,18 @@ curl -i -X POST http://localhost:8000/executions/audit \
 2. 变化次数相同时，逐段所选料卷 ID 元组的**字典序最小**（按顺序位置逐位
    比较，料卷 ID 字符串升序）。
 
-三种 200 状态：
+四种 200 状态：
 
 | `status` | 含义 |
 | --- | --- |
-| `ALLOCATED` | 找到覆盖全部层段的完整分配；`optimal` 表示两级目标是否均已证明最优 |
-| `MATERIAL_SHORTAGE` | 某材料全部料卷余量之和不足以覆盖该材料的累计需求（含换料 purge 与打印体积），或单卷容量碎片化导致逐段整卷扣减无法装下；**不产生任何分配**，`reason.deficits` 给出各材料缺料量 |
+| `ALLOCATED` | 找到覆盖全部层段的完整分配；`optimal` 表示两级目标是否均已证明最优（未证明时为 `false`，扣减仍如实给出） |
+| `MATERIAL_SHORTAGE` | **已证**无法完整分配：某材料全部料卷余量之和不足以覆盖该材料的累计需求（含换料 purge 与打印体积），或总量足够但 CP-SAT 证明单卷容量碎片化导致逐段整卷扣减无法装下；**不产生任何分配**，`reason.deficits` 给出各材料缺料量 |
 | `PURGE_CAPACITY_EXCEEDED` | 沿固定顺序的 purge 之和已超过 `total_purge_capacity_mm3`（顺序固定无法重排）；**不产生任何分配**，`reason` 给出所需 purge 与容量 |
+| `UNKNOWN` | **未判定**：CP-SAT 限时内既未证明无解也未给出可行解，且免求解构造兜底也找不到完整分配（兜底失败不证明无解）；**不产生任何分配**，各卷不扣减，`optimal=false`，`reason.undecided_materials` 列出未判定材料 |
 
-缺料 / 超容时 `allocation` 为空、各卷累计扣减为 0（库存原样列出）。
+缺料 / 超容 / 未判定时 `allocation` 为空、各卷累计扣减为 0（库存原样列出）。
+多材料合并时**已证缺料优先于未判定**：任一材料被证明无法完整分配即整体报
+`MATERIAL_SHORTAGE`；仅当没有已证缺料且至少一个材料未判定时才报 `UNKNOWN`。
 
 请求字段（仅列新增部分，其余字段与 `/plans` 完全一致）：
 
@@ -799,7 +810,11 @@ curl -X POST http://localhost:8000/spools/allocate \
 
 一个边界保证：同材料连续两段依次需要 4、6 mm³ 时，余量**恰为 4 与 6** 的
 两卷必须能分配——第一段用余量 4 的卷（扣 4）、第二段换余量 6 的卷（扣 6），
-不会因"总余量恰为总需求却无法共用一卷"而误报缺料。
+不会因"总余量恰为总需求却无法共用一卷"而误报缺料。余量对调（一卷 6、
+一卷 4）时同理：按料卷 ID 升序的贪心会把第一段 4 装进余量 6 的卷而失败，
+但正常时限下 CP-SAT 直接给出唯一可行分配（余量 4 的卷装第一段、余量 6 的
+卷装第二段）；即使 CP-SAT 超时且兜底也失败，也只返回 `UNKNOWN`（未判定），
+不会误报缺料。
 
 #### 缺料与超容响应
 
@@ -837,6 +852,77 @@ curl -X POST http://localhost:8000/spools/allocate \
 固定顺序的 purge 累计超出容量时返回 `PURGE_CAPACITY_EXCEEDED`（顺序固定、
 不重排），`reason.purge_required_mm3` / `reason.capacity_mm3` 给出所需 purge
 与容量，`purge_remaining_mm3` 为负值；该状态优先于缺料判定。
+
+#### 未判定（UNKNOWN）响应
+
+当实例较大而 `time_limit_seconds` 很紧时，CP-SAT 可能既未证明无解也未给出
+可行解；此时服务先用免求解的构造性兜底尝试，兜底也失败才返回 `UNKNOWN`——
+兜底失败**不证明**无解（例如同材料两段依次需 4、6 mm³，而两卷余量为 6、4 时，
+按料卷 ID 升序的贪心会把第一段装进余量 6 的卷导致失败，但交换两卷即可分配）。
+响应为空分配、各卷不扣减、`optimal=false`，`reason.undecided_materials`
+列出未判定的材料：
+
+```bash
+curl -X POST http://localhost:8000/spools/allocate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jobs": [
+      {"job_id": "J1", "deadline_seconds": 100000, "segments": [
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 4},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 6}]},
+      {"job_id": "J2", "deadline_seconds": 100000, "segments": [
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 1}]}
+    ],
+    "initial_material": "A",
+    "purge_matrix": {"A": {"A": 0, "B": 0}, "B": {"A": 0, "B": 0}},
+    "switch_seconds": 0,
+    "total_purge_capacity_mm3": 0,
+    "time_limit_seconds": 0.1,
+    "spools": [
+      {"spool_id": "SA", "material_id": "A", "remaining_mm3": 6},
+      {"spool_id": "SB", "material_id": "A", "remaining_mm3": 4},
+      {"spool_id": "BB", "material_id": "B", "remaining_mm3": 10}
+    ],
+    "order": [
+      {"job_id": "J1", "segment_index": 1},
+      {"job_id": "J1", "segment_index": 2},
+      {"job_id": "J2", "segment_index": 1}
+    ]
+  }'
+```
+
+**响应（未判定时的实际形态；该小实例在正常时限下会返回 `ALLOCATED`）**：
+
+```json
+{
+  "status": "UNKNOWN",
+  "optimal": false,
+  "allocation": [],
+  "spools": [
+    {"spool_id": "BB", "material_id": "B",
+     "initial_remaining_mm3": 10, "deducted_mm3": 0, "remaining_mm3": 10,
+     "deductions": []},
+    {"spool_id": "SA", "material_id": "A",
+     "initial_remaining_mm3": 6, "deducted_mm3": 0, "remaining_mm3": 6,
+     "deductions": []},
+    {"spool_id": "SB", "material_id": "A",
+     "initial_remaining_mm3": 4, "deducted_mm3": 0, "remaining_mm3": 4,
+     "deductions": []}
+  ],
+  "spool_changes": 0,
+  "purge_used_mm3": 0,
+  "purge_remaining_mm3": 0,
+  "reason": {
+    "code": "UNKNOWN",
+    "message": "材料 A 的料卷分配在限时内无法判定：CP-SAT 未证明无解，构造性兜底也未找到覆盖全部层段的完整分配；未产生任何分配",
+    "undecided_materials": ["A"]
+  },
+  "solver_message": "A: 限时内无法判定可行性（UNKNOWN），构造性兜底也未找到完整分配；既未证明可分配也未证明无解；B: 限时内 CP-SAT 未给出可行解（UNKNOWN）；返回构造性选卷，未证明变化次数与字典序最优"
+}
+```
+
+若 CP-SAT 超时但构造性兜底找到了完整选卷，则返回 `ALLOCATED` 并如实给出
+逐段扣减与余量，`optimal=false`（未证明变化次数与字典序最优）。
 
 #### 料卷分配请求的 422
 
@@ -902,7 +988,7 @@ curl -i -X POST http://localhost:8000/plans \
 ├── tests/
 │   ├── test_plans.py            # 16 个端到端测试（最优性、无解、交错、优先级、长作业、超时兜底、422 等）
 │   ├── test_executions_audit.py # 19 个端到端测试（完成/进行中、保留空闲、重叠、层序、换料留时、purge 与超容、422 等）
-│   └── test_spools_allocate.py  # 16 个端到端测试（选卷扣减、复用、变化次数优先、字典序决胜、4/6 边界、缺料/超容、422 等）
+│   └── test_spools_allocate.py  # 22 个端到端测试（选卷扣减、复用、变化次数优先、字典序决胜、4/6 边界、缺料/超容/未判定三态、422 等）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -978,5 +1064,16 @@ curl -i -X POST http://localhost:8000/plans \
 同材料相邻段选卷不同的次数（布尔蕴含刻画"两段同选一卷"），先最小化该
 次数；再逐位贪心固定料卷 ID（每步一次锁定最优次数的 CP-SAT 可行性
 证明）得到逐段料卷 ID 字典序最小解。任一步限时内无法判定，则返回当前
-可行选卷并把 `optimal` 置为 `false`；总量充足但单卷碎片化导致 CP 不可行
-时如实报 `MATERIAL_SHORTAGE`，缺料 / 超容均不产生任何部分分配。
+可行选卷并把 `optimal` 置为 `false`。
+
+单材料结论严格区分三态，多材料按"已证缺料优先于未判定"合并：
+
+- **已证无解**（CP-SAT `INFEASIBLE`）：总量充足但单卷碎片化被证明无法
+  完整分配 → 整体 `MATERIAL_SHORTAGE`（最终结论，不再等待其他材料）；
+- **未判定**（CP-SAT 超时且免求解构造兜底也失败）：兜底失败不证明无解
+  ——若其余材料均无已证缺料 → 整体 `UNKNOWN`，空分配、各卷不扣减、
+  `optimal=false`；若另有材料已证缺料，则仍报缺料；
+- **可行**（CP-SAT 或构造兜底给出覆盖全部层段的选卷）：给出完整扣减；
+  只有变化次数与字典序决胜均证明最优时 `optimal` 才为 `true`。
+
+缺料 / 超容 / 未判定均不产生任何部分分配。

@@ -442,24 +442,25 @@ class AllocateResponse(BaseModel):
     status: str = Field(
         ...,
         description=(
-            "ALLOCATED（已完整分配）/ MATERIAL_SHORTAGE（库存不足）/ "
-            "PURGE_CAPACITY_EXCEEDED（固定顺序的 purge 超出总容量）"
+            "ALLOCATED（已完整分配）/ MATERIAL_SHORTAGE（已证缺料）/ "
+            "PURGE_CAPACITY_EXCEEDED（固定顺序的 purge 超出总容量）/ "
+            "UNKNOWN（限时内未判定可行性：既未证明无解也未找到完整分配）"
         ),
     )
     optimal: bool = Field(
         ...,
         description=(
             "是否已证明分配最优（料卷变化次数最小且逐段料卷 ID 字典序决胜均证明）；"
-            "缺料 / 超容时为 false"
+            "缺料 / 超容 / 未判定时为 false"
         ),
     )
     allocation: list[AllocationItem] = Field(
         default_factory=list,
-        description="逐段选卷与扣减（按提交顺序）；缺料 / 超容时为空，不产生任何分配",
+        description="逐段选卷与扣减（按提交顺序）；缺料 / 超容 / 未判定时为空，不产生任何分配",
     )
     spools: list[SpoolBalance] = Field(
         default_factory=list,
-        description="各卷扣减汇总与余量；缺料 / 超容时累计扣减均为 0",
+        description="各卷扣减汇总与余量；缺料 / 超容 / 未判定时累计扣减均为 0",
     )
     spool_changes: int = Field(
         0, description="相邻层段所选料卷 ID 不同的次数（优化目标）"
@@ -474,7 +475,8 @@ class AllocateResponse(BaseModel):
         None,
         description=(
             "非 ALLOCATED 时的原因：MATERIAL_SHORTAGE 带各材料缺料明细，"
-            "PURGE_CAPACITY_EXCEEDED 带所需 purge 与总容量"
+            "PURGE_CAPACITY_EXCEEDED 带所需 purge 与总容量，"
+            "UNKNOWN 带未判定材料列表"
         ),
     )
     solver_message: str = ""

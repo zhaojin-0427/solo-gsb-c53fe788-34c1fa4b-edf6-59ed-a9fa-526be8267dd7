@@ -428,6 +428,136 @@ def test_fragmentation_reported_as_shortage():
     assert all(sp["deducted_mm3"] == 0 for sp in d["spools"])
 
 
+# --------------------- 已证无解 / 未判定 / 可行 三态 ---------------------
+
+
+def _four_six_reversed_payload(**kw):
+    """同材料两段需 4、6，SA 卷余量 6、SB 卷余量 4（按 ID 贪心必失败的形态）。"""
+    return _base(
+        [_job("J1", _seg("A", 4), _seg("A", 6)), _job("J2", _seg("B", 1))],
+        [_spool("SA", "A", 6), _spool("SB", "A", 4), _spool("BB", "B", 10)],
+        [_ref("J1", 1), _ref("J1", 2), _ref("J2", 1)],
+        initial="A",
+        purge={"A": {"A": 0, "B": 0}, "B": {"A": 0, "B": 0}},
+        capacity=0,
+        **kw,
+    )
+
+
+def test_four_six_reversed_spools_allocatable():
+    """回归：两段需 4、6，卷余量为 6、4 时同样必须能分配（唯一解 SB→4、SA→6）。
+
+    按料卷 ID 升序的贪心会把第一段 4 装进 SA（余 6）导致第二段 6 无处可放，
+    但 CP-SAT 在正常时限内直接给出唯一可行分配，不得误报缺料或未判定。
+    """
+    d = post(_four_six_reversed_payload())
+    assert d.status_code == 200, d.text
+    body = d.json()
+    assert body["status"] == "ALLOCATED"
+    picks = [(a["order"], a["spool_id"], a["deducted_mm3"]) for a in body["allocation"]]
+    assert picks == [(1, "SB", 4), (2, "SA", 6), (3, "BB", 1)]
+    assert body["spool_changes"] == 2  # A 内被迫换卷 1 次 + A→B 边界 1 次
+    assert body["optimal"] is True
+    assert {sp["spool_id"]: sp["remaining_mm3"] for sp in body["spools"]} == {
+        "SA": 0, "SB": 0, "BB": 9,
+    }
+
+
+def test_unknown_when_cpsat_undecided_and_fallback_fails(monkeypatch):
+    """CP-SAT 限时内 UNKNOWN 且构造兜底失败 → UNKNOWN，不得误报缺料。
+
+    两段需 4、6，SA=6、SB=4：按 ID 贪心失败（第一段占掉 SA），但 SB→4、
+    SA→6 实则可分配——未判定与已证无解必须区分。响应空分配、不扣减余量、
+    optimal=false。
+    """
+    from ortools.sat.python import cp_model
+
+    monkeypatch.setattr(
+        cp_model.CpSolver, "Solve", lambda self, model: cp_model.UNKNOWN
+    )
+    r = post(_four_six_reversed_payload())
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["status"] == "UNKNOWN"
+    assert d["optimal"] is False
+    assert d["allocation"] == []
+    assert d["spool_changes"] == 0
+    assert d["reason"]["code"] == "UNKNOWN"
+    assert d["reason"]["undecided_materials"] == ["A"]
+    # 未判定：各卷累计扣减为 0、余量等于初始
+    assert all(sp["deducted_mm3"] == 0 for sp in d["spools"])
+    assert all(sp["deductions"] == [] for sp in d["spools"])
+    assert {sp["spool_id"]: sp["remaining_mm3"] for sp in d["spools"]} == {
+        "SA": 6, "SB": 4, "BB": 10,
+    }
+
+
+def test_fallback_allocation_when_cpsat_unknown(monkeypatch):
+    """CP-SAT UNKNOWN 但构造兜底找到完整选卷 → ALLOCATED 且 optimal=false。
+
+    可行解如实给出逐段扣减与余量，但未证最优不得标最优。
+    """
+    from ortools.sat.python import cp_model
+
+    monkeypatch.setattr(
+        cp_model.CpSolver, "Solve", lambda self, model: cp_model.UNKNOWN
+    )
+    payload = _base(
+        [_job("J1", _seg("A", 4), _seg("A", 6)), _job("J2", _seg("B", 1))],
+        [_spool("SA", "A", 100), _spool("BB", "B", 10)],
+        [_ref("J1", 1), _ref("J1", 2), _ref("J2", 1)],
+        initial="A",
+        purge={"A": {"A": 0, "B": 0}, "B": {"A": 0, "B": 0}},
+        capacity=0,
+    )
+    d = post(payload).json()
+    assert d["status"] == "ALLOCATED"
+    assert d["optimal"] is False
+    assert [a["spool_id"] for a in d["allocation"]] == ["SA", "SA", "BB"]
+    sa = next(sp for sp in d["spools"] if sp["spool_id"] == "SA")
+    assert sa["deducted_mm3"] == 10
+    assert sa["remaining_mm3"] == 90
+    assert [x["remaining_after_mm3"] for x in sa["deductions"]] == [96, 90]
+
+
+def test_proven_shortage_takes_precedence_over_unknown(monkeypatch):
+    """多材料合并：材料 A 未判定、材料 B 已证碎片化无解 → 整体报缺料。
+
+    已证缺料优先于未判定；只有证实无法完整分配才报缺料。
+    """
+    from ortools.sat.python import cp_model
+
+    # A：两段需 4、6，SA=6、SB=4（CP-SAT 首次 Solve 被强制 UNKNOWN → 未判定）
+    # B：三段各需 10，卷 9+21 总量 30 够但碎片化（CP-SAT 证明 INFEASIBLE）
+    payload = _base(
+        [_job("J1", _seg("A", 4), _seg("A", 6)),
+         _job("J2", _seg("B", 10), _seg("B", 10), _seg("B", 10))],
+        [_spool("SA", "A", 6), _spool("SB", "A", 4),
+         _spool("B1", "B", 9), _spool("B2", "B", 21)],
+        [_ref("J1", 1), _ref("J1", 2), _ref("J2", 1), _ref("J2", 2), _ref("J2", 3)],
+        initial="A",
+        purge={"A": {"A": 0, "B": 0}, "B": {"A": 0, "B": 0}},
+        capacity=0,
+    )
+    real_solve = cp_model.CpSolver.Solve
+    calls = {"n": 0}
+
+    def fake_solve(self, model):
+        calls["n"] += 1
+        if calls["n"] == 1:  # 材料按 ID 升序求解：第一次调用对应材料 A
+            return cp_model.UNKNOWN
+        return real_solve(self, model)
+
+    monkeypatch.setattr(cp_model.CpSolver, "Solve", fake_solve)
+    d = post(payload).json()
+    assert d["status"] == "MATERIAL_SHORTAGE"
+    assert d["optimal"] is False
+    assert d["allocation"] == []
+    assert d["reason"]["code"] == "MATERIAL_SHORTAGE"
+    assert d["reason"]["deficits"][0]["material_id"] == "B"
+    assert all(sp["deducted_mm3"] == 0 for sp in d["spools"])
+
+
 # --------------------------------- 422 ---------------------------------
 
 
